@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use chrono::Utc;
 use anyhow::Result;
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 // Enhanced Models
 #[derive(Debug, Deserialize)]
@@ -131,23 +133,35 @@ async fn fetch_vendor_details(client_pool: &ClientPool, code: &str) -> Result<se
     Ok(vendor_detail.data)
 }
 
-async fn process_vendor_batch(
+async fn process_vendor_batch_with_writer(
     client_pool: &ClientPool,
     vendor_codes: Vec<String>,
-    vendors: &mut Vec<Vendor>,
+    json_writer: &Arc<Mutex<JsonWriter>>,
     batch_number: i32,
     total_batches: i32,
+    processed_count: &Arc<std::sync::atomic::AtomicI32>,
+    total_vendors: i32,
+    start_time: std::time::Instant,
 ) -> Result<()> {
     println!("Processing batch {}/{}", batch_number, total_batches);
 
     for (index, code) in vendor_codes.iter().enumerate() {
+        let current_count = processed_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        
+        // Calculate progress and ETA
+        let elapsed = start_time.elapsed();
+        let items_per_second = current_count as f64 / elapsed.as_secs_f64().max(1.0);
+        let remaining_items = total_vendors - current_count;
+        let estimated_seconds_remaining = remaining_items as f64 / items_per_second;
+        
         println!(
-            "Batch {}/{} - Processing vendor {}/{}: {}", 
+            "Batch {}/{} - Processing vendor {}/{}: {} (ETA: {:.1} minutes remaining)", 
             batch_number, 
             total_batches,
             index + 1, 
             vendor_codes.len(), 
-            code
+            code,
+            estimated_seconds_remaining / 60.0
         );
         
         match fetch_vendor_details(&client_pool, code).await {
@@ -159,9 +173,15 @@ async fn process_vendor_batch(
                         .unwrap_or("Unknown")
                         .to_string(),
                     details: Some(details),
-                    batch_number,  // Added batch number
+                    batch_number,
                 };
-                vendors.push(vendor);
+                
+                // Write vendor directly to file
+                if let Ok(writer) = json_writer.lock() {
+                    if let Err(e) = writer.write_vendor(&vendor) {
+                        eprintln!("Error writing vendor to file: {}", e);
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("Error fetching details for vendor {}: {}", code, e);
@@ -174,6 +194,61 @@ async fn process_vendor_batch(
 
     Ok(())
 }
+
+
+struct JsonWriter {
+    writer: Mutex<BufWriter<File>>,
+    count: std::sync::atomic::AtomicUsize,
+    first: bool,
+}
+
+impl JsonWriter {
+    fn new(filename: &str) -> Result<Self> {
+        let file = File::create(filename)?;
+        let mut writer = BufWriter::new(file);
+        
+        // Write the opening bracket
+        writer.write_all(b"[\n")?;
+        
+        Ok(Self {
+            writer: Mutex::new(writer),
+            count: std::sync::atomic::AtomicUsize::new(0),
+            first: true,
+        })
+    }
+
+    fn write_vendor(&self, vendor: &Vendor) -> Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        
+        // Add comma if not the first item
+        if !self.first {
+            writer.write_all(b",\n")?;
+        }
+        
+        // Serialize vendor to writer
+        serde_json::to_writer(&mut *writer, &vendor)?;
+        
+        // Flush periodically (every 10 vendors)
+        if self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 10 == 0 {
+            writer.flush()?;
+        }
+        
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.write_all(b"\n]")?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn get_count(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -189,6 +264,11 @@ async fn main() -> Result<()> {
 
     // City ID to process
     let city_id = "69036";
+
+    // Create JSON writer
+    let filename = format!("vendors_city_{}_{}_.json", city_id, timestamp.replace(" ", "_"));
+    let json_writer = JsonWriter::new(&filename)?;
+    let json_writer = Arc::new(Mutex::new(json_writer));
     
     // Get initial page to determine total count and page size
     let initial_response = fetch_vendor_page(&client_pool, city_id, 0, 48).await?;
@@ -201,16 +281,18 @@ async fn main() -> Result<()> {
         total_vendors, total_pages, page_size
     );
 
-    // Create a vector to store all vendor data
-    let mut vendors = Vec::with_capacity(total_vendors as usize);
+    let mut processed_count = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let start_time = std::time::Instant::now();
 
-    // Process initial page vendors
-    process_vendor_batch(
+    process_vendor_batch_with_writer(
         &client_pool,
         initial_response.data.items.into_iter().map(|item| item.code).collect(),
-        &mut vendors,
+        &json_writer,
         1,
-        total_pages
+        total_pages,
+        &processed_count,
+        total_vendors,
+        start_time,
     ).await?;
 
     // Process remaining pages
@@ -223,33 +305,40 @@ async fn main() -> Result<()> {
         let vendor_list = fetch_vendor_page(&client_pool, city_id, offset, page_size).await?;
         
         // Process vendors in this page
-        process_vendor_batch(
+        process_vendor_batch_with_writer(
             &client_pool,
             vendor_list.data.items.into_iter().map(|item| item.code).collect(),
-            &mut vendors,
+            &json_writer,
             page + 1,
-            total_pages
+            total_pages,
+            &mut processed_count,
+            total_vendors,
+            start_time,
         ).await?;
 
         // Rate limiting delay between pages
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
     }
 
-    // Save to JSON file
-    let filename = format!("vendors_city_{}_{}_.json", city_id, timestamp.replace(" ", "_"));
-    let file = File::create(&filename)?;
-    serde_json::to_writer_pretty(file, &vendors)?;
+    // Finish writing the JSON file and get final count
+    let final_count = {
+        let writer = json_writer.lock().unwrap();
+        writer.finish()?;
+        writer.get_count()
+    };
 
-    println!("Successfully saved {} vendors to {}", vendors.len(), filename);
-    
+    let total_time = start_time.elapsed();
+
     // Print summary
     println!("\nExtraction Summary:");
     println!("Timestamp: {}", timestamp);
     println!("User: {}", user_login);
     println!("City ID: {}", city_id);
-    println!("Total Vendors Processed: {}", vendors.len());
+    println!("Total Vendors Processed: {}", final_count);
     println!("Total Pages Processed: {}", total_pages);
     println!("Page Size: {}", page_size);
+    println!("Total Time: {:.2} minutes", total_time.as_secs_f64() / 60.0);
+    println!("Average Speed: {:.1} vendors/second", final_count as f64 / total_time.as_secs_f64());
     println!("Output File: {}", filename);
 
     Ok(())
