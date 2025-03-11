@@ -1,0 +1,23 @@
+[package]
+name = "foodpanda_etl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rquest = "3.0.5"
+rquest-util = "0.2.5"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+aws-sdk-s3 = "1.3"
+aws-config = "1.0"
+arrow = "54.2.1"
+parquet = "54.2.1"
+async-trait = "0.1"
+anyhow = "1.0"
+thiserror = "1.0"
+config = "0.13"
+http = "1.2.0"
