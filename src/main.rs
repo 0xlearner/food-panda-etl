@@ -1,102 +1,271 @@
 use std::sync::Arc;
-use std::sync::Mutex;
-use chrono::Utc;
+use tokio::sync::Mutex;
+use chrono::{Datelike, Utc};
 use anyhow::Result;
+use std::fs::{self, File};
+use tracing::{info, error};
+use tracing_subscriber::{
+    fmt::{self, time::UtcTime},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+    filter::{EnvFilter, LevelFilter},
+    Layer,
+};
+use tempfile::NamedTempFile;
+use std::io::BufReader;
 
 use foodpanda_etl::config::Settings;
-use foodpanda_etl::{fetch_vendor_page, process_vendor_batch_with_writer, upload_to_minio, sleep_with_jitter, ClientPool, JsonWriter};
+use foodpanda_etl::models::Vendor;
+use foodpanda_etl::storage::ParquetConverter;
+use foodpanda_etl::services::api::ApiService;
+use foodpanda_etl::services::vendor::VendorService;
+use foodpanda_etl::storage::JsonWriter;
+use foodpanda_etl::storage::minio::MinioUploader;
+use foodpanda_etl::clients::ClientPool;
+use foodpanda_etl::utils::time::sleep_with_jitter;
+
+fn get_log_filename(timestamp: &str, user_login: &str) -> String {
+    format!("logs/foodpanda_etl_{}_{}_.log", 
+        timestamp.replace(" ", "_"),
+        user_login
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let settings = Settings::new()?;
+
     
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let user_login = "xde719";
+    let user_login = std::env::var("USER_LOGIN").unwrap_or_else(|_| "default_user".to_string());
 
-    println!("Starting extraction at: {}", timestamp);
-    println!("User: {}", user_login);
-
-    let client_pool = Arc::new(ClientPool::new()?);
-    let city_id = "69036";
-
-    let filename = format!("vendors_city_{}_{}_.json", city_id, timestamp.replace(" ", "_"));
-    let json_writer = JsonWriter::new(&filename)?;
-    let json_writer = Arc::new(Mutex::new(json_writer));
+     // Create logs directory if it doesn't exist
+     fs::create_dir_all("logs")?;
     
-    // Get initial page to determine total count and page size
-    let initial_response = fetch_vendor_page(&client_pool, city_id, 0, 48).await?;
-    let total_vendors = initial_response.data.available_count;
-    let page_size = initial_response.data.returned_count;
-    let total_pages = (total_vendors as f32 / page_size as f32).ceil() as i32;
+     // Generate log filename
+     let log_file = get_log_filename(&timestamp, &user_login);
+     
+     // Create log file
+     let file = File::create(&log_file)?;
+ 
+     // Set up filter
+     let filter = EnvFilter::try_from_default_env()
+         .unwrap_or_else(|_| {
+             EnvFilter::default()
+                 .add_directive(LevelFilter::INFO.into())
+         });
+ 
+     // Create file writer layer
+     let file_layer = fmt::Layer::new()
+         .with_timer(UtcTime::rfc_3339())
+         .with_level(true)
+         .with_target(true)
+         .with_thread_ids(true)
+         .with_file(true)
+         .with_line_number(true)
+         .json()
+         .with_current_span(true)
+         .with_writer(file)
+         .with_filter(filter);
 
-    println!(
-        "Found {} total vendors, will process in {} pages of {} items each",
-        total_vendors, total_pages, page_size
+    let stdout_filter = EnvFilter::try_from_default_env()
+    .unwrap_or_else(|_| {
+        EnvFilter::default()
+            .add_directive(LevelFilter::DEBUG.into())
+    });
+ 
+     // Create stdout layer (console output)
+     let stdout_layer = fmt::Layer::new()
+         .with_timer(UtcTime::rfc_3339())
+         .with_level(true)
+         .with_target(true)
+         .with_thread_ids(true)
+         .with_file(true)
+         .with_line_number(true)
+         .json()
+         .with_current_span(true)
+         .with_filter(stdout_filter);
+ 
+     // Initialize both layers
+     tracing_subscriber::registry()
+         .with(file_layer)
+         .with(stdout_layer)
+         .init();
+
+    info!(
+        timestamp = timestamp,
+        user = user_login,
+        "Starting extraction"
     );
 
-    let processed_count = Arc::new(std::sync::atomic::AtomicI32::new(0));
-    let start_time = std::time::Instant::now();
+    let settings = Settings::new()?;
+    let client_pool = Arc::new(ClientPool::new(settings.clone())?);
+    let api_service = ApiService::new(client_pool.clone());
+    let vendor_service = VendorService::new(api_service.clone());
 
-    // Process all pages
-    for page in 0..total_pages {
-        let offset = page * page_size;
+    // Process each city from the configuration
+    for city_id in &settings.cities {
+        info!(city_id = city_id, "Processing city");
+
+        let filename = format!("vendors_city_{}_{}_.json", city_id, timestamp.replace(" ", "_"));
+        // Create temporary Parquet file
+        let temp_parquet = NamedTempFile::new()?;
+        let json_writer = JsonWriter::new(&filename).await?;  // Add .await here
+        let json_writer = Arc::new(Mutex::new(json_writer));
         
-        // Add delay between pages
-        if page > 0 {
-            sleep_with_jitter(2000, 1000).await;
+        // Get initial page to determine total count and page size
+        let initial_response = api_service.fetch_vendor_page(city_id, 0, 48).await?;
+        let total_vendors = initial_response.data.available_count;
+        let page_size = initial_response.data.returned_count;
+        let total_pages = (total_vendors as f32 / page_size as f32).ceil() as i32;
+
+        info!(
+            total_vendors = total_vendors,
+            total_pages = total_pages,
+            page_size = page_size,
+            "Vendor pagination details"
+        );
+
+        // Start timer
+        let start_time = std::time::Instant::now();
+
+        // Process all pages
+        for page in 0..total_pages {
+            let offset = page * page_size;
+            
+            if page > 0 {
+                sleep_with_jitter(2000, 1000).await;
+            }
+            
+            let response = api_service.fetch_vendor_page(city_id, offset, page_size).await?;
+            let vendor_codes: Vec<String> = response.data.items
+                .into_iter()
+                .map(|item| item.code)
+                .collect();
+
+            info!(
+                page = page + 1,
+                total_pages = total_pages,
+                vendors_count = vendor_codes.len(),
+                "Processing vendor batch"
+            );
+
+            match vendor_service.process_vendor_batch(
+                vendor_codes,
+                &json_writer,
+                page + 1,
+                total_pages,
+            ).await {
+                Ok(_) => info!(
+                    page = page + 1,
+                    total_pages = total_pages,
+                    "Batch processed successfully"
+                ),
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        page = page + 1,
+                        total_pages = total_pages,
+                        "Failed to process batch"
+                    );
+                    return Err(e.into());
+                }
+            }
         }
-        
-        let response = fetch_vendor_page(&client_pool, city_id, offset, page_size).await?;
-        let vendor_codes: Vec<String> = response.data.items
-            .into_iter()
-            .map(|item| item.code)
-            .collect();
 
-        process_vendor_batch_with_writer(
-            &client_pool,
-            vendor_codes,
-            &json_writer,
-            page + 1,
-            total_pages,
-            &processed_count,
-            total_vendors,
-            start_time,
+        // Finish writing and upload for this city
+        let final_count = {
+            let mut writer = json_writer.lock().await;  // Add .await here
+            writer.finish().await?;  // Add .await here
+            writer.get_count()
+        };
+
+        let total_time = start_time.elapsed();
+        let minutes = total_time.as_secs_f64() / 60.0;
+        let vendors_per_second = final_count as f64 / total_time.as_secs_f64();
+
+        info!(
+            city_id = city_id,
+            timestamp = timestamp,
+            user = user_login,
+            total_vendors = final_count,
+            total_pages = total_pages,
+            page_size = page_size,
+            total_minutes = minutes,
+            vendors_per_second = vendors_per_second,
+            output_file = filename,
+            "Extraction completed"
+        );
+
+        // Upload to MinIO
+        info!(city_id = city_id, "Starting MinIO upload");
+
+        // Initialize MinIO uploader once
+        let minio_uploader = MinioUploader::new(
+            &settings.minio.endpoint,
+            &settings.minio.access_key,
+            &settings.minio.secret_key,
+            &settings.minio.bucket,
+            &settings.minio.region,
         ).await?;
+        
+        info!(
+            city_id = city_id,
+            json_file = &filename,
+            "Converting JSON to Parquet"
+        );
+    
+        // Read JSON and convert to Parquet
+        let json_file = File::open(&filename)?;
+        let reader = BufReader::new(json_file);
+        let vendors: Vec<Vendor> = serde_json::from_reader(reader)?;
+    
+        // Convert to Parquet
+        ParquetConverter::convert_vendors_to_parquet(
+            &vendors,
+            temp_parquet.path().to_str().unwrap()
+        )?;
+    
+        // Generate partitioned S3 key
+        let now = Utc::now();
+        let s3_key = format!(
+            "city_id={}/year={}/month={:02}/day={:02}/vendors_{}.parquet",
+            city_id,
+            now.year(),
+            now.month(),
+            now.day(),
+            now.timestamp()
+        );
+
+        // Get file size before upload
+        let file_size = temp_parquet.as_file().metadata()?.len();
+
+        info!(
+            s3_key = &s3_key,
+            file_size_mb = file_size / (1024 * 1024),
+            "Uploading Parquet file to S3"
+        );
+
+        // Upload file
+        minio_uploader.upload_parquet_file(temp_parquet.path(), &s3_key).await?;
+
+        info!(
+            s3_key = s3_key,
+            vendors_count = vendors.len(),
+            file_size_mb = file_size / (1024 * 1024),
+            "Successfully uploaded Parquet file to S3"
+        );
+    
+        // Optionally cleanup the JSON file
+        if let Err(e) = std::fs::remove_file(&filename) {
+            error!(
+                error = %e,
+                filename = &filename,
+                "Failed to remove JSON file"
+            );
+        }
     }
+    
 
-    // Finish writing the JSON file and get final count
-    let final_count = {
-        let writer = json_writer.lock().unwrap();
-        writer.finish()?;
-        writer.get_count()
-    };
-
-    let total_time = start_time.elapsed();
-
-    // Print summary
-    println!("\nExtraction Summary:");
-    println!("Timestamp: {}", timestamp);
-    println!("User: {}", user_login);
-    println!("City ID: {}", city_id);
-    println!("Total Vendors Processed: {}", final_count);
-    println!("Total Pages Processed: {}", total_pages);
-    println!("Page Size: {}", page_size);
-    println!("Total Time: {:.2} minutes", total_time.as_secs_f64() / 60.0);
-    println!("Average Speed: {:.1} vendors/second", final_count as f64 / total_time.as_secs_f64());
-    println!("Output File: {}", filename);
-
-    // After processing is complete, upload to MinIO
-    println!("Uploading data to MinIO...");
-    upload_to_minio(
-        &filename,
-        city_id,
-        &settings.minio.endpoint,
-        &settings.minio.access_key,
-        &settings.minio.secret_key,
-        &settings.minio.bucket,
-        &settings.minio.region,
-    ).await?;
-
-    println!("Data upload complete!");
-
+    info!("All cities processed successfully");
     Ok(())
 }

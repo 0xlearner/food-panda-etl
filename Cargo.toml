@@ -3,18 +3,6 @@ name = "foodpanda_etl"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "main"
-path = "src/main.rs"
-
-[[bin]]
-name = "test_upload"
-path = "src/bin/test_upload.rs"
-
-[lib]
-name = "foodpanda_etl"
-path = "src/lib.rs"
-
 
 [dependencies]
 rquest = "3.0.5"
@@ -24,8 +12,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter", "local-time"] }
 aws-sdk-s3 = { version = "1.79.0", features = ["behavior-version-latest"] }
+aws-smithy-runtime-api = "1.7.4"
 aws-config = "1.6.0"
 arrow = { version = "54.2.1", features = ["json"] }
 parquet = { version = "54.2.1", features = ["arrow"] }
@@ -36,3 +25,4 @@ config = "0.13"
 http = "1.2.0"
 rand = "0.9.0"
 tempfile = "3.18.0"
+bytes = "1.10.1"
