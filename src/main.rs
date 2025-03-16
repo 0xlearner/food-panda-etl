@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
         let start_time = std::time::Instant::now();
 
         // Process all pages
-        for page in 0..2 {
+        for page in 0..total_pages {
             let offset = page * page_size;
             
             if page > 0 {
