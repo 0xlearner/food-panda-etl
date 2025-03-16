@@ -2,7 +2,7 @@ cities:
   - "69036"  # Example city ID
 
 minio:
-  endpoint: "http://localhost:9000"
+  endpoint: "http://minio:9000"
   access_key: "access_key"
   secret_key: "secret_key"
   bucket: "food-panda-vendors"

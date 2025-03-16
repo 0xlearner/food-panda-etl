@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
 use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncWriteExt, BufWriter as TokioBufWriter};
 use crate::error::Result;
@@ -12,7 +13,16 @@ pub struct JsonWriter {
 
 impl JsonWriter {
     pub async fn new(filename: &str) -> Result<Self> {
-        let file = TokioFile::create(filename).await?;
+        // Get the output directory from environment variable or use a default
+        let output_dir = std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "data".to_string());
+        
+        // Create the output directory if it doesn't exist
+        tokio::fs::create_dir_all(&output_dir).await?;
+        
+        // Combine the directory and filename
+        let path = Path::new(&output_dir).join(filename);
+        let file_path = path.to_str().unwrap();
+        let file = TokioFile::create(file_path).await?;
         let mut writer = TokioBufWriter::new(file);
         writer.write_all(b"[\n").await?;
         

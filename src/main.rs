@@ -13,6 +13,7 @@ use tracing_subscriber::{
 };
 use tempfile::NamedTempFile;
 use std::io::BufReader;
+use std::path::Path;
 
 use foodpanda_etl::config::Settings;
 use foodpanda_etl::models::Vendor;
@@ -106,6 +107,9 @@ async fn main() -> Result<()> {
     for city_id in &settings.cities {
         info!(city_id = city_id, "Processing city");
 
+        // Get output directory from environment variable or use a default
+        let output_dir = std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "data".to_string());
+
         let filename = format!("vendors_city_{}_{}_.json", city_id, timestamp.replace(" ", "_"));
         // Create temporary Parquet file
         let temp_parquet = NamedTempFile::new()?;
@@ -129,7 +133,7 @@ async fn main() -> Result<()> {
         let start_time = std::time::Instant::now();
 
         // Process all pages
-        for page in 0..total_pages {
+        for page in 0..2 {
             let offset = page * page_size;
             
             if page > 0 {
@@ -174,8 +178,8 @@ async fn main() -> Result<()> {
 
         // Finish writing and upload for this city
         let final_count = {
-            let mut writer = json_writer.lock().await;  // Add .await here
-            writer.finish().await?;  // Add .await here
+            let mut writer = json_writer.lock().await;  
+            writer.finish().await?;
             writer.get_count()
         };
 
@@ -215,7 +219,8 @@ async fn main() -> Result<()> {
         );
     
         // Read JSON and convert to Parquet
-        let json_file = File::open(&filename)?;
+        let file_path = Path::new(&output_dir).join(&filename);
+        let json_file = File::open(&file_path)?;
         let reader = BufReader::new(json_file);
         let vendors: Vec<Vendor> = serde_json::from_reader(reader)?;
     
@@ -256,16 +261,14 @@ async fn main() -> Result<()> {
         );
     
         // Optionally cleanup the JSON file
-        if let Err(e) = std::fs::remove_file(&filename) {
+        if let Err(e) = std::fs::remove_file(&file_path) {
             error!(
                 error = %e,
-                filename = &filename,
+                filename = file_path.to_string_lossy().to_string(),
                 "Failed to remove JSON file"
             );
         }
     }
-    
-
     info!("All cities processed successfully");
     Ok(())
 }
