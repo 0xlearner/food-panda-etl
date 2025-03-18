@@ -31,6 +31,9 @@ pub enum Error {
     #[error("Forbidden - Access denied")]
     Forbidden,
 
+    #[error("Gateway timeout")]
+    GatewayTimeout,
+
     #[error("Maximum retries exceeded")]
     MaxRetriesExceeded,
 

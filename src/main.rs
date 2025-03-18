@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
         let filename = format!("vendors_city_{}_{}_.json", city_id, timestamp.replace(" ", "_"));
         // Create temporary Parquet file
         let temp_parquet = NamedTempFile::new()?;
-        let json_writer = JsonWriter::new(&filename).await?;  // Add .await here
+        let json_writer = JsonWriter::new(&filename).await?;
         let json_writer = Arc::new(Mutex::new(json_writer));
         
         // Get initial page to determine total count and page size
@@ -202,6 +202,8 @@ async fn main() -> Result<()> {
 
         // Upload to MinIO
         info!(city_id = city_id, "Starting MinIO upload");
+
+        
 
         // Initialize MinIO uploader once
         let minio_uploader = MinioUploader::new(

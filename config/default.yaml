@@ -1,5 +1,7 @@
 cities:
-  - "69036"  # Example city ID
+  - "69036"
+  - "107681"
+  - "200253"
 
 minio:
   endpoint: "http://minio:9000"

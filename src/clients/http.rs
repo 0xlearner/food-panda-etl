@@ -5,6 +5,8 @@ use http::StatusCode;
 use crate::error::Result;
 use crate::config::Settings;
 use tracing::{error, debug};
+use std::time::Duration;
+use tokio::time::sleep;
 
 pub struct HttpClient {
     client: Client,
@@ -43,6 +45,7 @@ impl HttpClient {
 
         let client = Client::builder()
             .emulation(emulation)
+            .timeout(Duration::from_secs(30))
             .build()?;
 
         Ok(Self { 
@@ -69,46 +72,86 @@ impl HttpClient {
     }
 
     pub async fn send(&self, request: RequestBuilder) -> Result<Response> {
-        // Build the request to inspect headers
-        let built_request = request.try_clone()
-            .expect("Failed to clone request")
-            .build()?;
+        const MAX_RETRIES: u32 = 3;
+        const BASE_DELAY_MS: u64 = 2000;
         
-        debug!(
-            url = %built_request.url(),
-            headers = ?built_request.headers().iter()
-                .map(|(k, v)| (k.as_str(), v.to_str().unwrap_or("invalid")))
-                .collect::<Vec<_>>(),
-            "Sending request"
-        );
-        
-        let response = request.send().await?;
-        
-        debug!(
-            status = response.status().as_u16(),
-            url = %response.url(),
-            response_headers = ?response.headers().iter()
-                .map(|(k, v)| (k.as_str(), v.to_str().unwrap_or("invalid")))
-                .collect::<Vec<_>>(),
-            "Response received"
-        );
-    
-        match response.status() {
-            StatusCode::TOO_MANY_REQUESTS => {
-                debug!("Rate limit exceeded");
-                Err(crate::error::Error::RateLimit)
-            },
-            StatusCode::FORBIDDEN => {
-                debug!(
-                    url = %response.url(),
-                    response_headers = ?response.headers().iter()
-                        .map(|(k, v)| (k.as_str(), v.to_str().unwrap_or("invalid")))
-                        .collect::<Vec<_>>(),
-                    "Received 403 Forbidden"
-                );
-                Err(crate::error::Error::Forbidden)
-            },
-            _ => Ok(response)
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            
+            let built_request = request.try_clone()
+                .expect("Failed to clone request")
+                .build()?;
+            
+            debug!(
+                url = %built_request.url(),
+                attempt = attempts,
+                headers = ?built_request.headers().iter()
+                    .map(|(k, v)| (k.as_str(), v.to_str().unwrap_or("invalid")))
+                    .collect::<Vec<_>>(),
+                "Sending request"
+            );
+            
+            match request.try_clone()
+                .expect("Failed to clone request")
+                .send()
+                .await 
+            {
+                Ok(response) => {
+                    debug!(
+                        status = response.status().as_u16(),
+                        url = %response.url(),
+                        response_headers = ?response.headers().iter()
+                            .map(|(k, v)| (k.as_str(), v.to_str().unwrap_or("invalid")))
+                            .collect::<Vec<_>>(),
+                        "Response received"
+                    );
+                
+                    match response.status() {
+                        StatusCode::TOO_MANY_REQUESTS => {
+                            if attempts >= MAX_RETRIES {
+                                return Err(crate::error::Error::RateLimit);
+                            }
+                            sleep(Duration::from_millis(BASE_DELAY_MS * 2u64.pow(attempts - 1))).await;
+                            continue;
+                        },
+                        StatusCode::FORBIDDEN => {
+                            debug!(
+                                url = %response.url(),
+                                "Received 403 Forbidden"
+                            );
+                            return Err(crate::error::Error::Forbidden);
+                        },
+                        StatusCode::GATEWAY_TIMEOUT => {
+                            if attempts >= MAX_RETRIES {
+                                return Err(crate::error::Error::Http(response.error_for_status().unwrap_err()));
+                            }
+                            debug!(
+                                url = %response.url(),
+                                attempt = attempts,
+                                "Gateway timeout, retrying after delay"
+                            );
+                            sleep(Duration::from_millis(BASE_DELAY_MS * 2u64.pow(attempts - 1))).await;
+                            continue;
+                        },
+                        _ => return Ok(response)  // Return successful responses immediately
+                    }
+                },
+                Err(e) => {
+                    if attempts >= MAX_RETRIES {
+                        return Err(e.into());
+                    }
+                    
+                    debug!(
+                        error = %e,
+                        attempt = attempts,
+                        "Connection error, retrying after delay"
+                    );
+                    
+                    sleep(Duration::from_millis(BASE_DELAY_MS * 2u64.pow(attempts - 1))).await;
+                    continue;
+                }
+            }
         }
     }
 }
